@@ -5,7 +5,8 @@ services:
     container_name: kafka-1
     hostname: kafka-1
     platform: linux/amd64
-    image: docker.io/apache/kafka:3.8.0
+    image: kafka:catalog
+    pull_policy: never
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -29,7 +30,8 @@ services:
     container_name: kafka-2
     hostname: kafka-2
     platform: linux/amd64
-    image: docker.io/apache/kafka:3.8.0
+    image: kafka:catalog
+    pull_policy: never
     environment:
       KAFKA_NODE_ID: 2
       KAFKA_PROCESS_ROLES: broker,controller
@@ -53,7 +55,8 @@ services:
     container_name: kafka-3
     hostname: kafka-3
     platform: linux/amd64
-    image: docker.io/apache/kafka:3.8.0
+    image: kafka:catalog
+    pull_policy: never
     environment:
       KAFKA_NODE_ID: 3
       KAFKA_PROCESS_ROLES: broker,controller
@@ -72,3 +75,21 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  workload:
+    container_name: workload
+    hostname: workload
+    platform: linux/amd64
+    build:
+      context: ../workload
+      dockerfile: workload.Dockerfile
+    image: kafka-pbt-workload:catalog
+    environment:
+      NO_COLOR: 1
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
