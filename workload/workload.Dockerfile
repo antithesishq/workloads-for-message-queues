@@ -1,10 +1,22 @@
-FROM --platform=linux/amd64 docker.io/library/golang:1.24 AS builder
-WORKDIR /src
-COPY . ./
-RUN go mod tidy
-RUN CGO_ENABLED=0 go build -o /workload .
+# The Workload image contains binaries and configuration to exercise the SUT
 
-FROM --platform=linux/amd64 docker.io/library/debian:bookworm-slim
-COPY --from=builder /workload /usr/local/bin/workload
-ENV NO_COLOR=1
-CMD ["/usr/local/bin/workload"]
+# Start from an a base golang image 
+FROM docker.io/golang:1.24-bookworm
+
+# Set working directory
+WORKDIR /app
+
+# Copy go module files first (for caching)
+COPY go.mod go.sum* ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the source code
+COPY ./main.go .
+
+# Build the binary
+RUN go build -o /workload main.go
+
+# Run the compiled binary
+ENTRYPOINT ["/workload"]

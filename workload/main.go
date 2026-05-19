@@ -2,6 +2,8 @@ package main
 
 import (
 	"log"
+	"math"
+	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/lifecycle"
 )
@@ -9,7 +11,6 @@ import (
 func main() {
 	log.Println("workload: kafka cluster reported healthy via compose depends_on; signaling setup_complete")
 
-	lifecycle.SetupComplete(map[string]any{
-		"message": "3-node KRaft kafka cluster ready!",
-	})
+	lifecycle.SetupComplete("3-node KRaft kafka cluster ready!")
+	time.Sleep(math.MaxInt64)
 }
