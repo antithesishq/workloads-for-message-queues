@@ -15,9 +15,10 @@ func main() {
 	log.Println("workload: kafka cluster reported healthy via compose depends_on; signaling setup_complete")
 	lifecycle.SetupComplete("3-node KRaft kafka cluster ready!")
 
-	go createTopic(ctx)
-	go produce(ctx)
-	go consume(ctx)
+	createTopic(ctx)
+	produce(ctx)
+	consume(ctx)
 
+	log.Println("workload: test complete, keeping container alive")
 	time.Sleep(math.MaxInt64)
 }
