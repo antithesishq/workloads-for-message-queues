@@ -20,7 +20,7 @@ const (
 	topic        = "no-data-corruption-and-liveness-test"
 	messageCount = 10
 	dataLength   = 64
-	pollTimeout  = 5 * time.Second
+	pollTimeout  = 2 * time.Second
 )
 
 var checksums = map[string]string{}
@@ -68,6 +68,8 @@ func produce(ctx context.Context) {
 	}
 	defer client.Close()
 
+	ts := time.Now()
+
 	for range messageCount {
 		id := uuid.New().String()
 		data := []byte(randomString(dataLength))
@@ -84,6 +86,8 @@ func produce(ctx context.Context) {
 
 		checksums[id] = sha256sum(data)
 		log.Printf("published uuid=%s\n", id)
+		assert.AlwaysLessThanOrEqualTo(time.Since(ts), 2*time.Second, "Producer makes progress", map[string]any{"time since last successful publish": ts, "current time": time.Now()})
+		ts = time.Now()
 	}
 	log.Printf("producer done: %d messages recorded in hashtable\n", len(checksums))
 }
@@ -99,6 +103,7 @@ func consume(ctx context.Context) {
 	}
 	defer client.Close()
 
+	messageCount := 0
 	for {
 		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		fetches := client.PollFetches(pollCtx)
@@ -106,10 +111,13 @@ func consume(ctx context.Context) {
 
 		if fetches.NumRecords() == 0 {
 			log.Println("consumer done: no new messages within poll timeout, queue assumed empty")
+			log.Printf("consumer done: %d records fetched.\n", messageCount)
+			assert.Always(messageCount == len(checksums), "No data loss", map[string]any{"Messages published": len(checksums), "Messages consumed": messageCount})
 			return
 		}
 
-		log.Printf("consumer done: %d records fetched.\n", fetches.NumRecords())
+		messageCount += fetches.NumRecords()
+		log.Printf("%d records fetched.\n", fetches.NumRecords())
 
 		fetches.EachRecord(verifyChecksum)
 	}
@@ -125,7 +133,7 @@ func verifyChecksum(r *kgo.Record) {
 	}
 	assert.Always(
 		computed == expected,
-		"consumed message checksum matches produced (no data corruption)",
+		"No data corruption",
 		map[string]any{
 			"uuid":     id,
 			"expected": expected,
