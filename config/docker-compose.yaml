@@ -83,7 +83,7 @@ services:
     build:
       context: ../workload
       dockerfile: workload.Dockerfile
-    image: kafka-pbt-workload:catalog
+    image: workload:catalog
     environment:
       NO_COLOR: 1
     depends_on:
