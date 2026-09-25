@@ -17,7 +17,7 @@ const (
 	atLeastOnceTopic         = "at-least-once-plus-ordering-test"
 	numConsumerGroups        = 3
 	atLeastOnceMessageCount  = 10
-	atLeastOnceLoopDelay     = 60 * time.Second
+	atLeastOnceLoopDelay     = 5 * time.Second
 )
 
 type consumerState struct {
@@ -59,7 +59,8 @@ func runAtLeastOnce(ctx context.Context) {
 
 	var seq int64
 
-	for range workloadIterations {
+	for i := range workloadIterations {
+		log.Printf("[at-least-once] iteration %d/%d\n", i+1, workloadIterations)
 		acked := map[string]bool{}
 
 		for range atLeastOnceMessageCount {
@@ -67,13 +68,15 @@ func runAtLeastOnce(ctx context.Context) {
 			id := uuid.New().String()
 			data := []byte(randomString(dataLength))
 
-			err := producer.ProduceSync(ctx, &kgo.Record{
+			opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
+			err := producer.ProduceSync(opCtx, &kgo.Record{
 				Key:   []byte(id),
 				Value: data,
 				Headers: []kgo.RecordHeader{
 					{Key: "seq", Value: []byte(strconv.FormatInt(seq, 10))},
 				},
 			}).FirstErr()
+			opCancel()
 
 			if err != nil {
 				log.Printf("[at-least-once] publish failed uuid=%s seq=%d: %v\n", id, seq, err)
@@ -123,7 +126,9 @@ func runAtLeastOnce(ctx context.Context) {
 					})
 				}
 
-				cs.client.CommitUncommittedOffsets(ctx)
+				commitCtx, commitCancel := context.WithTimeout(ctx, operationTimeout)
+				cs.client.CommitUncommittedOffsets(commitCtx)
+				commitCancel()
 
 				for id := range acked {
 					assert.Always(consumed[id], "At least once delivery", map[string]any{

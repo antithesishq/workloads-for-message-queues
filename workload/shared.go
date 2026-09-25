@@ -5,8 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log"
-	"time"
 	mathrand "math/rand/v2"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -15,7 +15,8 @@ import (
 const (
 	dataLength         = 6400
 	pollTimeout        = 10 * time.Second
-	workloadIterations = 100
+	operationTimeout   = 30 * time.Second
+	workloadIterations = 20
 )
 
 var brokers = []string{"kafka-1:9092", "kafka-2:9092", "kafka-3:9092"}

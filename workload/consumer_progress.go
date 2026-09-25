@@ -57,7 +57,9 @@ func backfillProgress(ctx context.Context, ready chan<- struct{}) {
 			Value: []byte(randomString(dataLength)),
 		}
 	}
-	err := client.ProduceSync(ctx, records...).FirstErr()
+	opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
+	err := client.ProduceSync(opCtx, records...).FirstErr()
+	opCancel()
 	if err != nil {
 		log.Printf("[consumer-progress] initial fill failed: %v\n", err)
 	}
@@ -67,7 +69,9 @@ func backfillProgress(ctx context.Context, ready chan<- struct{}) {
 	for ctx.Err() == nil {
 		time.Sleep(backfillInterval)
 
-		lags, err := adm.Lag(ctx, consumerProgressCGroup)
+		lagCtx, lagCancel := context.WithTimeout(ctx, operationTimeout)
+		lags, err := adm.Lag(lagCtx, consumerProgressCGroup)
+		lagCancel()
 		if err != nil {
 			log.Printf("[consumer-progress] lag query failed: %v\n", err)
 			continue
@@ -79,7 +83,7 @@ func backfillProgress(ctx context.Context, ready chan<- struct{}) {
 		}
 
 		log.Printf("[consumer-progress] lag=%v topup=%v\n", lags[consumerProgressCGroup].Lag.Total(), topUp)
-		
+
 		records := make([]*kgo.Record, int(topUp))
 		for i := range records {
 			records[i] = &kgo.Record{
@@ -87,7 +91,9 @@ func backfillProgress(ctx context.Context, ready chan<- struct{}) {
 			}
 		}
 
-		err = client.ProduceSync(ctx, records...).FirstErr()
+		bfCtx, bfCancel := context.WithTimeout(ctx, operationTimeout)
+		err = client.ProduceSync(bfCtx, records...).FirstErr()
+		bfCancel()
 		if err != nil {
 			log.Printf("[consumer-progress] backfill failed: %v\n", err)
 			continue
@@ -109,7 +115,8 @@ func consumeProgress(ctx context.Context) {
 	adm := kadm.NewClient(client)
 	lastConsumed := time.Now()
 
-	for range workloadIterations {
+	for i := range workloadIterations {
+		log.Printf("[consumer-progress] iteration %d/%d\n", i+1, workloadIterations)
 		pollCtx, cancel := context.WithTimeout(ctx, consumerProgressPollTimeout)
 		fetches := client.PollFetches(pollCtx)
 		cancel()
@@ -126,9 +133,11 @@ func consumeProgress(ctx context.Context) {
 		elapsed := time.Since(lastConsumed)
 
 		var lag int64
-		if lags, err := adm.Lag(ctx, consumerProgressCGroup); err == nil {
+		cLagCtx, cLagCancel := context.WithTimeout(ctx, operationTimeout)
+		if lags, err := adm.Lag(cLagCtx, consumerProgressCGroup); err == nil {
 			lag = lags[consumerProgressCGroup].Lag.Total()
 		}
+		cLagCancel()
 
 		stuck := elapsed > consumerProgressPollTimeout
 		assert.Always(!stuck, "Consumer can make progress", map[string]any{

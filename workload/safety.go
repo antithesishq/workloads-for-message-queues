@@ -13,7 +13,7 @@ import (
 const (
 	safetyTopic        = "safety-test"
 	safetyMessageCount = 10
-	safetyLoopDelay    = 60 * time.Second
+	safetyLoopDelay    = 5 * time.Second
 )
 
 func runSafety(ctx context.Context) {
@@ -33,7 +33,8 @@ func runSafety(ctx context.Context) {
 	)
 	defer consumer.Close()
 
-	for range workloadIterations {
+	for i := range workloadIterations {
+		log.Printf("[safety] iteration %d/%d\n", i+1, workloadIterations)
 		acked := map[string]bool{}
 		consumed := map[string]bool{}
 
@@ -42,13 +43,15 @@ func runSafety(ctx context.Context) {
 			data := []byte(randomString(dataLength))
 			checksum := sha256sum(data)
 
-			err := producer.ProduceSync(ctx, &kgo.Record{
+			opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
+			err := producer.ProduceSync(opCtx, &kgo.Record{
 				Key:   []byte(id),
 				Value: data,
 				Headers: []kgo.RecordHeader{
 					{Key: "checksum", Value: []byte(checksum)},
 				},
 			}).FirstErr()
+			opCancel()
 
 			if err != nil {
 				log.Printf("[safety] publish failed uuid=%s: %v\n", id, err)

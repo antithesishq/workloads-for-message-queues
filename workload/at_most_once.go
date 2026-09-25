@@ -13,7 +13,7 @@ import (
 const (
 	atMostOnceTopic         = "at-most-once-plus-producer-progress-test"
 	atMostOnceMessageCount  = 10
-	atMostOnceLoopDelay     = 60 * time.Second
+	atMostOnceLoopDelay     = 5 * time.Second
 	producerProgressTimeout = 120 * time.Second
 )
 
@@ -35,7 +35,8 @@ func runAtMostOnce(ctx context.Context) {
 	)
 	defer consumer.Close()
 
-	for range workloadIterations {
+	for i := range workloadIterations {
+		log.Printf("[at-most-once] iteration %d/%d\n", i+1, workloadIterations)
 		consumed := map[string]bool{}
 		lastPublish := time.Now()
 
@@ -49,10 +50,12 @@ func runAtMostOnce(ctx context.Context) {
 			id := uuid.New().String()
 			data := []byte(randomString(dataLength))
 
-			err := producer.ProduceSync(ctx, &kgo.Record{
+			opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
+			err := producer.ProduceSync(opCtx, &kgo.Record{
 				Key:   []byte(id),
 				Value: data,
 			}).FirstErr()
+			opCancel()
 
 			if err != nil {
 				log.Printf("[at-most-once] publish failed uuid=%s: %v\n", id, err)
