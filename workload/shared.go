@@ -14,9 +14,8 @@ import (
 
 const (
 	dataLength         = 6400
-	pollTimeout        = 10 * time.Second
-	operationTimeout   = 30 * time.Second
-	workloadIterations = 20
+	pollTimeout      = 10 * time.Second
+	operationTimeout = 30 * time.Second
 )
 
 var brokers = []string{"kafka-1:9092", "kafka-2:9092", "kafka-3:9092"}

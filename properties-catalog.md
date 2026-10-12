@@ -12,8 +12,9 @@ This is not an exhaustive list of properties you should be testing your message 
 2. Producer progress (Liveness)  
 3. Consumer progress (Liveness)  
 4. No data loss (Safety)  
-5. Publish ordering (Safety)  
-6. Message delivery guarantee (Safety)
+5. No phantom messages (Safety)  
+6. Message ordering (Safety)
+7. Message delivery guarantee (Safety)
 
 ### No data corruption
 
@@ -21,12 +22,10 @@ Messages are not corrupted or truncated when published or delivered
 
 #### How to test this
 
-* Use one producer and one consumer.
-* For each message, generate random data, and compute a checksum of the data.  
-* Publish the message.  
-* Only after the publish is acknowledged, record the checksum in local memory.  
-* Consume messages until the queue is empty or no new messages arrive within a poll timeout.  
-* For each consumed message, recompute the checksum and compare it with the recorded checksum.  
+* Use one producer and one consumer running concurrently in a single container.
+* The producer generates a UUID, random data, computes a SHA-256 checksum, and attaches the checksum as a message header.
+* The producer publishes the message with the UUID as the key, the random data as the value, and the checksum as a header.
+* The consumer recomputes the checksum of each consumed message's value and compares it with the checksum in the header.
 * Any checksum mismatch is a data corruption failure.
 
 ### Producer progress
@@ -35,10 +34,11 @@ The producer should be able to progress and keep publishing data to the queue.
 
 #### How to test this
 
-* Use one producer.  
-* Keep attempting to publish in a loop.  
-* On every successful acknowledged publish, update a `last_successful_publish` timestamp.  
-* If the producer is still trying to publish and the time since the last successful publish exceeds a configurable liveness timeout, fail the test.
+* Use one producer that continuously publishes messages in a loop.
+* On each iteration, roll a dice (1 in N chance) to trigger a liveness check, but only if one isn't already active.
+* When triggered, call the Antithesis stop-faults API with a 2-minute duration. Faults resume automatically after the duration.
+* During the no-faults window, if a produce gets acknowledged, assert the liveness property. If no produce is ever acknowledged during any no-faults window, the assertion is never triggered, and it's a property failure.
+* When the deadline passes, reset and resume normal operation.
 
 ### Consumer progress
 
@@ -46,10 +46,12 @@ Messages in the queue waiting to be delivered should be eventually delivered.
 
 #### How to test this 
 
-* Producer publishes N messages  
-* Producer monitors state of the queue and tries to keep the number of messages to N  
-  * E.g. N=100, after some time there are 90 messages \=\> publish 10 more.  
-* Consumer keeps consuming, if too long since the last consumed message, consumer may be stuck
+* Use one consumer that continuously polls for messages in a loop.
+* A separate producer thread continuously publishes messages to ensure there is always data available for the consumer.
+* On each iteration, roll a dice (1 in N chance) to trigger a liveness check, but only if one isn't already active.
+* When triggered, call the Antithesis stop-faults API with a 2-minute duration. Faults resume automatically after the duration.
+* During the no-faults window, if a poll returns at least one record, assert the liveness property. If no records are ever consumed during any no-faults window, the assertion is never triggered, and it's a property failure.
+* When the deadline passes, reset and resume normal operation.
 
 ### No data loss
 
@@ -57,11 +59,11 @@ Committed messages are not lost
 
 #### How to test this
 
-* Use one producer and one consumer.  
-* Publish a burst of messages and record each acknowledged message UUID.  
-* Consume messages until the queue is empty or no new messages arrive within a poll timeout.  
-* Track the set of acknowledged message UUIDs that have been consumed.  
-* If any acknowledged message remains unconsumed after the timeout, fail the test.
+* Use one producer and one consumer running concurrently in a single container.
+* The producer writes each message as `UUID,0` to a shared state file before publishing. After receiving an ack, it flips the `0` to `1` with a single-byte write at a known offset.
+* The consumer uses a consumer group with manual offset commits and tracks the last consumed UUID in a persisted state file for crash recovery.
+* When the consumer receives a message with UUID N, it reads the state file sequentially from the previous consumed UUID+1 through N. Any UUID in that range marked as acked (`1`) that was not delivered is a data loss.
+* Consumer state is persisted (atomic write via temp file + fsync + rename) before committing the offset, so the worst case on crash is a single redelivery.
 
 ### No phantom messages
 
@@ -69,11 +71,10 @@ Messages that were never produced cannot be consumed
 
 #### How to test this
 
-* One producer, one consumer.  
-* Publish a chunk of messages and record each acknowledged message UUID.  
-* Consume messages until queue is empty or timeout.  
-* Track the set of acknowledged message UUIDs that are consumed.  
-* If a UUID consumed doesn’t exist in the producer’s list of acknowledged messages, fail the test.
+* Tested in the same workload as no data loss and message ordering.
+* The consumer reads the shared state file to verify each consumed UUID. The file is the source of truth for what was actually produced.
+* When the consumer receives UUID N, it reads the state file from prevConsumed+1 through N. If a UUID is not found in the file or doesn’t match the expected sequence, the message is a phantom — it was never produced.
+* The state file reader tails the file, waiting for the producer to write more data, with an overall timeout to detect genuine phantoms.
 
 ### Delivery guarantee
 
@@ -85,16 +86,11 @@ The queue will deliver the message once and not redeliver it. This ensures that 
 
 ##### How to test this
 
-* Two containers \-\> 1 producer, 1 consumer (maybe multiple producers)  
-* No producer retries  
-* Producer loop  
-  * Generate a long uuid, random data  
-  * Publish to queue  
-    * No retry on failure  
-* Consumer loop  
-  * Init set for consumed messages  
-  * Consume message, push uuid to set  
-    * If duplicate in set \-\> violation
+* Use one producer and one consumer running concurrently in a single container.
+* The producer does not retry on failure (fire and forget). It records only the UUIDs that were acknowledged by the broker in a shared state file.
+* The consumer commits the offset before processing each message. This ensures that after a crash, the consumer resumes from the next message and never reprocesses one.
+* The consumer tracks consumed UUIDs in a persistent set. If a UUID appears twice, it is a duplicate delivery — a violation of the at-most-once guarantee.
+* **Note:** Because the consumer commits before processing, a crash between committing and recording the UUID means that message is effectively skipped. This means "all acked UUIDs consumed" cannot be guaranteed under fault injection, so we only assert the no-duplicates property.
 
 #### At least once
 
@@ -102,17 +98,10 @@ The queue will deliver the message once and keep retrying until it receives an a
 
 ##### How to test this
 
-* Multi container \-\> 1 producer, n consumer groups (one consumer each)  
-* Producer retries  
-* Producer loop  
-  * Generate a random data, header sequence num/counter  
-  * Publish to queue  
-  * Track the ack’d messages uuid  
-* Consumer loop  
-  * Track sequence num/counter of consumed messages  
-  * Consume message  
-  * Message should be either a duplicate or the next sequence number  
-  * Mark off uuid from the producer set, no missing uuid 
+* Use one producer and one consumer running concurrently in a single container.
+* The producer retries each message until it receives an ack. For each UUID, it records the number of send attempts and the number of acks in a shared state file.
+* The consumer tracks how many times it has consumed each UUID in its own persistent state.
+* On each consume, the consumer checks that its count for that UUID is within bounds: `acks <= consumed <= attempts`. A consumed count below acks means a message was lost; above attempts means the broker fabricated a delivery.
 
 ### Message ordering
 
@@ -122,12 +111,7 @@ Kafka promises per-partition strict message ordering. So, in the reference workl
 
 #### How to test this
 
-* Multi container \-\> 1 producer, n consumer groups (one consumer each)  
-* Producer retries  
-* Producer loop  
-  * Generate a random data, header sequence no/counter  
-  * Publish to queue  
-* Consumer loop  
-  * Track sequence num/counter of consumed messages  
-  * Consume message  
-  * Message should be either a duplicate or the next sequence number
+* Tested in the same workload as no data loss and no phantom messages.
+* The producer assigns monotonically increasing UUIDs to each message.
+* The consumer tracks the last consumed UUID. Each newly consumed UUID must be strictly greater than the previous one.
+* If the consumer receives the exact same UUID as the last consumed (redelivery after a crash), it is safely skipped. Any other out-of-order UUID is an ordering violation.

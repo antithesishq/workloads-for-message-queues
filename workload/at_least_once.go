@@ -1,159 +1,212 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
+	mathrand "math/rand/v2"
+	"os"
 	"strconv"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
-	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 const (
-	atLeastOnceTopic         = "at-least-once-plus-ordering-test"
-	numConsumerGroups        = 3
-	atLeastOnceMessageCount  = 10
-	atLeastOnceLoopDelay     = 5 * time.Second
+	aloTopic         = "alo-test"
+	aloConsumerGroup = "alo-group"
+	aloProducerLog   = "/tmp/alo-producer.log"
+	aloConsumerLog   = "/tmp/alo-consumer.log"
 )
 
-type consumerState struct {
-	client      *kgo.Client
-	group       string
-	expectedSeq int64
-}
-
 func runAtLeastOnce(ctx context.Context) {
-	createTopic(ctx, atLeastOnceTopic, 1, 3, "2")
+	createTopic(ctx, aloTopic, 1, 3, "2")
 
-	producer := newClient("at-least-once",
+	producerLog, err := os.OpenFile(aloProducerLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("[alo] failed to open producer log: %v", err)
+	}
+	defer producerLog.Close()
+
+	consumerLog, err := os.OpenFile(aloConsumerLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("[alo] failed to open consumer log: %v", err)
+	}
+	defer consumerLog.Close()
+
+	producerLogReader, err := os.Open(aloProducerLog)
+	if err != nil {
+		log.Fatalf("[alo] failed to open producer log for reading: %v", err)
+	}
+	defer producerLogReader.Close()
+
+	consumerLogReader, err := os.Open(aloConsumerLog)
+	if err != nil {
+		log.Fatalf("[alo] failed to open consumer log for reading: %v", err)
+	}
+	defer consumerLogReader.Close()
+
+	producer := newClient("alo-producer",
 		kgo.SeedBrokers(brokers...),
-		kgo.DefaultProduceTopic(atLeastOnceTopic),
+		kgo.DefaultProduceTopic(aloTopic),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RecordRetries(0),
 	)
 	defer producer.Close()
 
-	consumers := make([]consumerState, numConsumerGroups)
-	for i := range consumers {
-		group := fmt.Sprintf("at-least-once-group-%d", i)
-		consumers[i] = consumerState{
-			client: newClient("at-least-once",
-				kgo.SeedBrokers(brokers...),
-				kgo.ConsumeTopics(atLeastOnceTopic),
-				kgo.ConsumerGroup(group),
-				kgo.DisableAutoCommit(),
-				kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-			),
-			group:       group,
-			expectedSeq: 1,
-		}
-	}
-	defer func() {
-		for _, c := range consumers {
-			c.client.Close()
-		}
-	}()
+	consumer := newClient("alo-consumer",
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(aloTopic),
+		kgo.ConsumerGroup(aloConsumerGroup),
+		kgo.DisableAutoCommit(),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	defer consumer.Close()
 
-	var seq int64
+	go aloProduce(ctx, producer, producerLog)
+	go aloConsume(ctx, consumer, consumerLog)
+	aloOracle(producerLogReader, consumerLogReader)
+}
 
-	for i := range workloadIterations {
-		log.Printf("[at-least-once] iteration %d/%d\n", i+1, workloadIterations)
-		acked := map[string]bool{}
+func aloProduce(ctx context.Context, client *kgo.Client, logFile *os.File) {
+	for {
+		uuid := mathrand.Int64()
+		uuidStr := strconv.FormatInt(uuid, 10)
+		data := []byte(randomString(dataLength))
 
-		for range atLeastOnceMessageCount {
-			seq++
-			id := uuid.New().String()
-			data := []byte(randomString(dataLength))
-
-			opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
-			err := producer.ProduceSync(opCtx, &kgo.Record{
-				Key:   []byte(id),
+		for {
+			opCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+			err := client.ProduceSync(opCtx, &kgo.Record{
+				Key:   []byte(uuidStr),
 				Value: data,
-				Headers: []kgo.RecordHeader{
-					{Key: "seq", Value: []byte(strconv.FormatInt(seq, 10))},
-				},
 			}).FirstErr()
-			opCancel()
+			cancel()
 
-			if err != nil {
-				log.Printf("[at-least-once] publish failed uuid=%s seq=%d: %v\n", id, seq, err)
-				continue
+			if err == nil {
+				fmt.Fprintf(logFile, "%d,1\n", uuid)
+				logFile.Sync()
+				log.Printf("[alo] published uuid=%d", uuid)
+				break
 			}
 
-			acked[id] = true
+			fmt.Fprintf(logFile, "%d,0\n", uuid)
+			logFile.Sync()
+			log.Printf("[alo] produce failed uuid=%d: %v", uuid, err)
+			time.Sleep(1 * time.Second)
 		}
-
-		log.Printf("[at-least-once] produced %d messages\n", len(acked))
-
-		var wg sync.WaitGroup
-		for i := range consumers {
-			wg.Add(1)
-			go func(cs *consumerState) {
-				defer wg.Done()
-				consumed := map[string]bool{}
-
-				for {
-					pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
-					fetches := cs.client.PollFetches(pollCtx)
-					cancel()
-
-					if fetches.NumRecords() == 0 {
-						break
-					}
-
-					fetches.EachRecord(func(r *kgo.Record) {
-						id := string(r.Key)
-						msgSeq := parseSeqHeader(r.Headers)
-
-						if msgSeq < cs.expectedSeq {
-							// Duplicate, expected for at-least-once
-						} else {
-							inOrder := msgSeq == cs.expectedSeq
-							assert.Always(inOrder, "Message ordering", map[string]any{
-								"group": cs.group, "expected": cs.expectedSeq, "got": msgSeq, "uuid": id,
-							})
-							if !inOrder {
-								log.Printf("[at-least-once] ordering violation group=%s expected=%d got=%d uuid=%s\n",
-									cs.group, cs.expectedSeq, msgSeq, id)
-							}
-							cs.expectedSeq = msgSeq + 1
-						}
-
-						consumed[id] = true
-					})
-				}
-
-				commitCtx, commitCancel := context.WithTimeout(ctx, operationTimeout)
-				cs.client.CommitUncommittedOffsets(commitCtx)
-				commitCancel()
-
-				for id := range acked {
-					assert.Always(consumed[id], "At least once delivery", map[string]any{
-						"group": cs.group, "uuid": id,
-					})
-					if !consumed[id] {
-						log.Printf("[at-least-once] missing message group=%s uuid=%s\n", cs.group, id)
-					}
-				}
-			}(&consumers[i])
-		}
-		wg.Wait()
-
-		log.Printf("[at-least-once] consumed across %d groups\n", numConsumerGroups)
-		log.Printf("[at-least-once] iteration done\n")
-		time.Sleep(atLeastOnceLoopDelay)
 	}
 }
 
-func parseSeqHeader(headers []kgo.RecordHeader) int64 {
-	for _, h := range headers {
-		if h.Key == "seq" {
-			n, _ := strconv.ParseInt(string(h.Value), 10, 64)
-			return n
+func aloConsume(ctx context.Context, client *kgo.Client, logFile *os.File) {
+	for {
+		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		fetches := client.PollFetches(pollCtx)
+		cancel()
+
+		if fetches.NumRecords() == 0 {
+			continue
 		}
+
+		fetches.EachRecord(func(r *kgo.Record) {
+			uuid, err := strconv.ParseInt(string(r.Key), 10, 64)
+			if err != nil {
+				log.Printf("[alo] invalid message key: %q", string(r.Key))
+				return
+			}
+			fmt.Fprintf(logFile, "%d\n", uuid)
+			logFile.Sync()
+		})
+
+		commitCtx, commitCancel := context.WithTimeout(ctx, operationTimeout)
+		client.CommitUncommittedOffsets(commitCtx)
+		commitCancel()
 	}
-	return 0
+}
+
+func aloOracle(producerLog, consumerLog *os.File) {
+	type uuidState struct {
+		attempts int
+		acks     int
+		consumed int
+	}
+	state := make(map[int64]*uuidState)
+
+	producerReader := bufio.NewReader(producerLog)
+	consumerReader := bufio.NewReader(consumerLog)
+	var producerPartial, consumerPartial string
+
+	for {
+		producerPartial = drainLines(producerReader, producerPartial, func(line string) {
+			parts := strings.SplitN(line, ",", 2)
+			if len(parts) != 2 {
+				return
+			}
+			uuid, err := strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				return
+			}
+			ack, _ := strconv.Atoi(parts[1])
+
+			s, ok := state[uuid]
+			if !ok {
+				s = &uuidState{}
+				state[uuid] = s
+			}
+			s.attempts++
+			if ack == 1 {
+				s.acks++
+			}
+		})
+
+		consumerPartial = drainLines(consumerReader, consumerPartial, func(line string) {
+			uuid, err := strconv.ParseInt(line, 10, 64)
+			if err != nil {
+				return
+			}
+
+			s, ok := state[uuid]
+			if !ok {
+				s = &uuidState{}
+				state[uuid] = s
+			}
+			s.consumed++
+
+			if s.attempts > 0 {
+				inBounds := s.consumed >= s.acks && s.consumed <= s.attempts
+				assert.Always(inBounds, "At least once delivery", map[string]any{
+					"uuid": uuid, "consumed": s.consumed, "attempts": s.attempts, "acks": s.acks,
+				})
+				if !inBounds {
+					log.Printf("[alo] bounds violation uuid=%d consumed=%d acks=%d attempts=%d",
+						uuid, s.consumed, s.acks, s.attempts)
+				}
+			}
+		})
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func drainLines(reader *bufio.Reader, partial string, handler func(string)) string {
+	for {
+		chunk, err := reader.ReadString('\n')
+		partial += chunk
+
+		if err == nil {
+			handler(strings.TrimRight(partial, "\n"))
+			partial = ""
+			continue
+		}
+
+		if err == io.EOF {
+			return partial
+		}
+
+		log.Printf("[alo] log read error: %v", err)
+		return partial
+	}
 }

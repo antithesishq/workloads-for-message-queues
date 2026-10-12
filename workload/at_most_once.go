@@ -2,94 +2,131 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
-	"time"
+	mathrand "math/rand/v2"
+	"os"
+	"strconv"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
-	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 const (
-	atMostOnceTopic         = "at-most-once-plus-producer-progress-test"
-	atMostOnceMessageCount  = 10
-	atMostOnceLoopDelay     = 5 * time.Second
-	producerProgressTimeout = 120 * time.Second
+	amoTopic             = "amo-test"
+	amoConsumerGroup     = "amo-group"
+	amoConsumerStateFile = "/tmp/amo-consumer-state.txt"
+	amoSeenLineWidth     = 20 // "0000000000000000000\n"
 )
 
 func runAtMostOnce(ctx context.Context) {
-	createTopic(ctx, atMostOnceTopic, 1, 3, "2")
+	createTopic(ctx, amoTopic, 1, 3, "2")
 
-	producer := newClient("at-most-once",
+	consumerState, err := os.OpenFile(amoConsumerStateFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		log.Fatalf("[amo] failed to open consumer state file: %v", err)
+	}
+	defer consumerState.Close()
+
+	producer := newClient("amo-producer",
 		kgo.SeedBrokers(brokers...),
-		kgo.DefaultProduceTopic(atMostOnceTopic),
+		kgo.DefaultProduceTopic(amoTopic),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
-		kgo.RecordRetries(1),
+		kgo.RecordRetries(0),
 	)
 	defer producer.Close()
 
-	consumer := newClient("at-most-once",
+	consumer := newClient("amo-consumer",
 		kgo.SeedBrokers(brokers...),
-		kgo.ConsumeTopics(atMostOnceTopic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
+		kgo.ConsumeTopics(amoTopic),
+		kgo.ConsumerGroup(amoConsumerGroup),
+		kgo.DisableAutoCommit(),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 	)
 	defer consumer.Close()
 
-	for i := range workloadIterations {
-		log.Printf("[at-most-once] iteration %d/%d\n", i+1, workloadIterations)
-		consumed := map[string]bool{}
-		lastPublish := time.Now()
+	go amoProduce(ctx, producer)
+	amoConsume(ctx, consumer, consumerState)
+}
 
-		for range atMostOnceMessageCount {
-			assert.Always(
-				time.Since(lastPublish) <= producerProgressTimeout,
-				"Producer makes progress",
-				map[string]any{"elapsed": time.Since(lastPublish).String(), "timeout": producerProgressTimeout.String()},
-			)
+func amoProduce(ctx context.Context, client *kgo.Client) {
+	for {
+		uuid := mathrand.Int64()
+		uuidStr := strconv.FormatInt(uuid, 10)
+		data := []byte(randomString(dataLength))
 
-			id := uuid.New().String()
-			data := []byte(randomString(dataLength))
+		opCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+		err := client.ProduceSync(opCtx, &kgo.Record{
+			Key:   []byte(uuidStr),
+			Value: data,
+		}).FirstErr()
+		cancel()
 
-			opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
-			err := producer.ProduceSync(opCtx, &kgo.Record{
-				Key:   []byte(id),
-				Value: data,
-			}).FirstErr()
-			opCancel()
+		if err != nil {
+			log.Printf("[amo] publish failed uuid=%d: %v", uuid, err)
+		} else {
+			log.Printf("[amo] published uuid=%d", uuid)
+		}
+	}
+}
 
+func loadAmoSeenSet(f *os.File) map[int64]bool {
+	seen := make(map[int64]bool)
+	f.Seek(0, io.SeekStart)
+	buf := make([]byte, amoSeenLineWidth)
+	for {
+		n, err := io.ReadFull(f, buf)
+		if n < amoSeenLineWidth {
+			break
+		}
+		uuid, _ := strconv.ParseInt(string(buf[0:19]), 10, 64)
+		seen[uuid] = true
+		if err != nil {
+			break
+		}
+	}
+	log.Printf("[amo] loaded consumer state, %d records", len(seen))
+	return seen
+}
+
+func amoConsume(ctx context.Context, client *kgo.Client, stateFile *os.File) {
+	seen := loadAmoSeenSet(stateFile)
+	nextOffset, _ := stateFile.Seek(0, io.SeekEnd)
+
+	for {
+		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		fetches := client.PollFetches(pollCtx)
+		cancel()
+
+		if fetches.NumRecords() == 0 {
+			continue
+		}
+
+		commitCtx, commitCancel := context.WithTimeout(ctx, operationTimeout)
+		client.CommitUncommittedOffsets(commitCtx)
+		commitCancel()
+
+		fetches.EachRecord(func(r *kgo.Record) {
+			uuid, err := strconv.ParseInt(string(r.Key), 10, 64)
 			if err != nil {
-				log.Printf("[at-most-once] publish failed uuid=%s: %v\n", id, err)
-				continue
+				log.Printf("[amo] invalid message key: %q", string(r.Key))
+				return
 			}
 
-			lastPublish = time.Now()
-		}
-
-		for {
-			pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
-			fetches := consumer.PollFetches(pollCtx)
-			cancel()
-
-			if fetches.NumRecords() == 0 {
-				break
-			}
-
-			fetches.EachRecord(func(r *kgo.Record) {
-				id := string(r.Key)
-
-				assert.Always(!consumed[id], "At most once delivery", map[string]any{
-					"uuid": id, "offset": r.Offset,
-				})
-				if consumed[id] {
-					log.Printf("[at-most-once] duplicate uuid=%s offset=%d\n", id, r.Offset)
-				}
-
-				consumed[id] = true
+			duplicate := seen[uuid]
+			assert.Always(!duplicate, "At most once delivery", map[string]any{
+				"uuid": uuid,
 			})
-		}
+			if duplicate {
+				log.Printf("[amo] duplicate delivery uuid=%d", uuid)
+			}
 
-		log.Printf("[at-most-once] consumed %d messages\n", len(consumed))
-		log.Printf("[at-most-once] iteration done\n")
-		time.Sleep(atMostOnceLoopDelay)
+			seen[uuid] = true
+			line := fmt.Sprintf("%019d\n", uuid)
+			stateFile.WriteAt([]byte(line), nextOffset)
+			stateFile.Sync()
+			nextOffset += amoSeenLineWidth
+		})
 	}
 }
