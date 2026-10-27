@@ -1,4 +1,4 @@
-module github.com/antithesishq/kafka-antithesis-workload/at-most-once
+module github.com/antithesishq/kafka-antithesis-workload
 
 go 1.27.2
 

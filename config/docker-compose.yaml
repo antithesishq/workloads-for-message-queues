@@ -1,8 +1,8 @@
-name: kafka-at-most-once
+name: kafka-workload
 
 x-kafka: &kafka
   build:
-    context: ../../kafka
+    context: ../kafka
   image: kafka-workload-kafka:latest
   platform: linux/amd64
   init: true
@@ -67,9 +67,9 @@ services:
   workload:
     build:
       context: ../workload
-    image: kafka-at-most-once-workload:latest
-    container_name: at-most-once-workload
-    hostname: at-most-once-workload
+    image: kafka-workload:latest
+    container_name: workload
+    hostname: workload
     platform: linux/amd64
     init: true
     environment:
