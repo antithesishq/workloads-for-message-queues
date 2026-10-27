@@ -10,7 +10,7 @@ This repository provides a set of property-based tests for Apache Kafka using An
 * Consumer progress (Liveness)  
 * Message delivery guarantee (Safety)
 
-The workload implemented here tests at-most-once delivery semantics. The producer never retries a failed send, so an unacknowledged message may be lost, but no message should ever appear twice. If you want to test at-least-once semantics instead, see [Testing at-least-once delivery](https://file+.vscode-resource.vscode-cdn.net/home/vidhi/src/workloads-for-message-queues/README.md#testing-at-least-once-delivery).
+The workload implemented here tests at-most-once delivery semantics. The producer never retries a failed send, so an unacknowledged message may be lost, but no message should ever appear twice. If you want to test at-least-once semantics instead, see [Testing at-least-once delivery](#testing-at-least-once-delivery).
 
 ## The test environment
 
